@@ -1,0 +1,377 @@
+#include <ntifs.h>
+#include <ntddk.h>
+
+// DebugView
+// registry key to see debug messages (on target machine): reg add "HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Debug Print Filter" /t REG_DWORD /d 0xf
+// currently debbuging with VS will only work once.. then the VM needs to be resetted to a snapshot
+// PsSetCreateProcessNotifyRoutineEx requires "/integritycheck" as linker argument to work properly
+
+DRIVER_DISPATCH IOCTL_DispatchRoutine;
+
+#define IOCTL_MONITOR_HANDLES_OF_PROCESS  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x4711, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+UNICODE_STRING DEVICE_NAME = RTL_CONSTANT_STRING(L"\\Device\\CIKHDevice");
+UNICODE_STRING DEVICE_SYMBOLIC_NAME = RTL_CONSTANT_STRING(L"\\??\\CIKHDeviceLink");
+
+// Kernel-Mode Process and Thread Manager callbacks
+BOOLEAN monitorThreadCreation = 0;
+BOOLEAN monitorProcessCreation = 0;
+BOOLEAN monitorImageLoading = 0;
+
+// ObRegisterCallback
+BOOLEAN monitorHandleOperationPreCallback = 1;
+BOOLEAN monitorHandleOperationPostCallback = 0;
+
+PVOID obCallbackRegistrationHandle = NULL;
+
+HANDLE currentlyMonitoredProcess = NULL;
+
+NTSTATUS IOCTL_DispatchRoutine(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+{
+	UNREFERENCED_PARAMETER(DeviceObject);
+	PIO_STACK_LOCATION stackLocation = NULL;
+	CHAR* successMessage = "[Info] - Driver is monitoring process";
+	CHAR* errorMessage = "[Error] - Driver could not find processId";
+	CHAR* message = "hi";
+
+	stackLocation = IoGetCurrentIrpStackLocation(Irp);
+	if (stackLocation->Parameters.DeviceIoControl.IoControlCode == IOCTL_MONITOR_HANDLES_OF_PROCESS)
+	{
+		DbgPrintEx(0, 0, "[Info] - Received IOCTL_MONITOR_HANDLES_OF_PROCESS %lx\n", stackLocation->Parameters.DeviceIoControl.IoControlCode);
+
+		PHANDLE handle = Irp->AssociatedIrp.SystemBuffer;
+		DbgPrintEx(0, 0, "\tMonitor process %p\n", *handle);
+
+		PEPROCESS process = NULL;
+		PUNICODE_STRING processName = NULL;
+		NTSTATUS status = 0;
+		status = PsLookupProcessByProcessId(*handle, &process);
+		if (!NT_SUCCESS(status))
+		{
+			message = errorMessage;
+		}
+		else
+		{
+			currentlyMonitoredProcess = *handle;
+			message = successMessage;
+			SeLocateProcessImageName(process, &processName);
+		}
+	}
+
+	Irp->IoStatus.Information = strlen(message);
+	Irp->IoStatus.Status = STATUS_SUCCESS;
+
+	RtlCopyMemory(Irp->AssociatedIrp.SystemBuffer, message, strlen(message));
+
+	IoCompleteRequest(Irp, IO_NO_INCREMENT);
+	return STATUS_SUCCESS;
+}
+
+NTSTATUS MajorFunctions(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+{
+	UNREFERENCED_PARAMETER(DeviceObject);
+	PIO_STACK_LOCATION stackLocation = NULL;
+	stackLocation = IoGetCurrentIrpStackLocation(Irp);
+	switch (stackLocation->MajorFunction)
+	{
+	case IRP_MJ_CREATE:
+		DbgPrintEx(0, 0, "Handle to symbolink link %wZ opened\n", DEVICE_SYMBOLIC_NAME);
+		break;
+	case IRP_MJ_CLOSE:
+		DbgPrintEx(0, 0, "Handle to symbolink link %wZ closed\n", DEVICE_SYMBOLIC_NAME);
+		break;
+	default:
+		break;
+	}		Irp->IoStatus.Information = 0;
+	Irp->IoStatus.Status = STATUS_SUCCESS;
+	IoCompleteRequest(Irp, IO_NO_INCREMENT);
+	return STATUS_SUCCESS;
+}
+
+// called when a thread is created or deleted
+// https://docs.microsoft.com/en-us/windows-hardware/drivers/ddi/ntddk/nc-ntddk-pcreate_thread_notify_routine
+void CreateThreadNotification_Callback(HANDLE ProcessId, HANDLE ThreadId, BOOLEAN Create)
+{
+	UNREFERENCED_PARAMETER(ThreadId);
+
+	if (!monitorThreadCreation)
+	{
+		return;
+	}
+
+	if (Create)
+	{
+		PEPROCESS process = NULL;
+		PUNICODE_STRING processName = NULL;
+		PsLookupProcessByProcessId(ProcessId, &process);
+		SeLocateProcessImageName(process, &processName);
+		//DbgPrintEx(0, 0, "[Info] - Process %wZ(%p) created thread %p\n", processName, ProcessId, ThreadId);
+	}
+	else
+	{
+		//DbgPrintEx(0, 0, "[Info] - Process %p deleted thread %p\n", ProcessId, ThreadId);
+	}
+}
+
+// called when a process is created or exits
+// https://docs.microsoft.com/en-us/windows-hardware/drivers/ddi/ntddk/nc-ntddk-pcreate_process_notify_routine_ex
+void CreateProcessNotification_Callback(PEPROCESS Process, HANDLE ProcessId, PPS_CREATE_NOTIFY_INFO CreateInfo)
+{
+	UNREFERENCED_PARAMETER(Process);
+	UNREFERENCED_PARAMETER(ProcessId);
+
+	if (!monitorProcessCreation)
+	{
+		return;
+	}
+
+	DbgPrintEx(0, 0, "[Info] - CreateProcessNotificationRoutine called\n");
+
+	if (CreateInfo != NULL)
+	{
+		DbgPrintEx(0, 0, "\tCreating process for image %wZ\n", CreateInfo->ImageFileName);
+	}
+}
+
+// called when an image is mapped into memory (loaded)
+// https://docs.microsoft.com/en-us/windows-hardware/drivers/ddi/ntddk/nc-ntddk-pload_image_notify_routine
+void LoadImageNotification_Callback(PUNICODE_STRING FullImageName, HANDLE ProcessId, PIMAGE_INFO ImageInfo)
+{
+	if (!monitorImageLoading)
+	{
+		return;
+	}
+
+	DbgPrintEx(0, 0, "[Info] - LoadImageNotification_Callback\n");
+	if (FullImageName && ProcessId && ImageInfo)
+	{
+		PEPROCESS process = NULL;
+		PUNICODE_STRING processName = NULL;
+
+		PsLookupProcessByProcessId(ProcessId, &process);
+		SeLocateProcessImageName(process, &processName);
+		DbgPrintEx(0, 0, "\tProcess %wZ(%p) loaded image %wZ at %p\n", processName, ProcessId, FullImageName, ImageInfo->ImageBase);
+	}
+}
+
+void GetProcessNameFromId(HANDLE processId, PUNICODE_STRING* name)
+{
+	PEPROCESS process = NULL;
+	PsLookupProcessByProcessId(processId, &process);
+	SeLocateProcessImageName(process, name);
+}
+
+// called before a handle operation occures
+// https://docs.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nc-wdm-pob_pre_operation_callback
+OB_PREOP_CALLBACK_STATUS PreHandleOperationCallback(PVOID RegistrationContext, POB_PRE_OPERATION_INFORMATION pOperationInformation)
+{
+	UNREFERENCED_PARAMETER(RegistrationContext);
+
+	if (!monitorHandleOperationPreCallback)
+	{
+		return OB_PREOP_SUCCESS;
+	}
+
+	if (!currentlyMonitoredProcess || PsGetProcessId(PsGetCurrentProcess()) != currentlyMonitoredProcess)
+	{
+		return OB_PREOP_SUCCESS;
+	}
+
+	PUNICODE_STRING currentProcessName = NULL;
+	GetProcessNameFromId(PsGetProcessId(PsGetCurrentProcess()), &currentProcessName);
+
+	if (pOperationInformation->Operation == OB_OPERATION_HANDLE_CREATE)
+	{
+		ULONG desiredAccess = pOperationInformation->Parameters->CreateHandleInformation.OriginalDesiredAccess;
+		PVOID targetObject = pOperationInformation->Object;
+		POBJECT_TYPE targetObjectType = pOperationInformation->ObjectType;
+
+		// only print all acess for the time being
+		// TODO disable when doing live tests
+		//if (desiredAccess != PROCESS_ALL_ACCESS)
+		//{
+		//	return OB_PREOP_SUCCESS;
+		//}
+
+		DbgPrintEx(0, 0, "[Info] - Handle operation PreCallback - %wZ\n", currentProcessName);
+
+		if (targetObjectType == *PsProcessType)
+		{
+			PUNICODE_STRING processName = NULL;
+			GetProcessNameFromId(PsGetProcessId(targetObject), &processName);
+
+			DbgPrintEx(0, 0, "\tCreating handle to process %wZ(%p) with access %lx\n", processName, targetObject, desiredAccess);
+		}
+		else // PsThreadType
+		{
+			DbgPrintEx(0, 0, "\tCreating handle to thread %p with access %lx\n", targetObject, desiredAccess);
+		}
+
+	}
+	else // OB_OPERATION_HANDLE_DUPLICATE
+	{
+		ULONG desiredAccess = pOperationInformation->Parameters->DuplicateHandleInformation.OriginalDesiredAccess;
+		PVOID targetObject = pOperationInformation->Object;
+		POBJECT_TYPE targetObjectType = pOperationInformation->ObjectType;
+		PVOID sourceProcess = pOperationInformation->Parameters->DuplicateHandleInformation.SourceProcess;
+		PVOID targetProcess = pOperationInformation->Parameters->DuplicateHandleInformation.TargetProcess;
+
+		// only print all acess for the time being
+		// TODO disable when doing live tests
+		//if (desiredAccess != PROCESS_ALL_ACCESS)
+		//{
+		//	return OB_PREOP_SUCCESS;
+		//}
+
+		DbgPrintEx(0, 0, "[Info] - Handle operation PreCallback - %wZ\n", currentProcessName);
+
+		PUNICODE_STRING processName = NULL;
+		GetProcessNameFromId(PsGetProcessId(targetObject), &processName);
+
+		PUNICODE_STRING sourceProcessName = NULL;
+		GetProcessNameFromId(PsGetProcessId(sourceProcess), &sourceProcessName);
+
+		PUNICODE_STRING targetProcessName = NULL;
+		GetProcessNameFromId(PsGetProcessId(targetProcess), &targetProcessName);
+
+		if (targetObjectType == *PsProcessType)
+		{
+			DbgPrintEx(0, 0, "\tDuplicating handle to process %wZ(%p) with access %lx (source: %wZ, target: %wZ)\n", processName, targetObject, desiredAccess, sourceProcessName, targetProcessName);
+		}
+		else // PsThreadType
+		{
+			DbgPrintEx(0, 0, "\tDuplicating handle to thread %p with access %lx\n (source: %wZ, target:%wZ)\n", targetObject, desiredAccess, sourceProcessName, targetProcessName);
+		}
+	}
+	return OB_PREOP_SUCCESS;
+}
+
+// called after a handle operation occures
+// https://docs.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nc-wdm-pob_post_operation_callback
+void PostHandleOperationCallback(PVOID RegistrationContext, POB_POST_OPERATION_INFORMATION pOperationInformation)
+{
+	if (!monitorHandleOperationPostCallback)
+	{
+		return;
+	}
+
+	UNREFERENCED_PARAMETER(RegistrationContext);
+	UNREFERENCED_PARAMETER(pOperationInformation);
+
+	DbgPrintEx(0, 0, "[Info] - ObRegisterCallback - Post Callback\n");
+}
+
+void DriverUnload(PDRIVER_OBJECT dob)
+{
+	UNREFERENCED_PARAMETER(dob);
+	DbgPrintEx(0, 0, "[Info] - Unloading KernelHook driver\n");
+
+	PsSetCreateProcessNotifyRoutineEx(CreateProcessNotification_Callback, TRUE);
+	PsRemoveCreateThreadNotifyRoutine(CreateThreadNotification_Callback);
+	PsRemoveLoadImageNotifyRoutine(LoadImageNotification_Callback);
+	ObUnRegisterCallbacks(obCallbackRegistrationHandle);
+
+	IoDeleteDevice(dob->DeviceObject);
+	IoDeleteSymbolicLink(&DEVICE_SYMBOLIC_NAME);
+}
+
+// Entry function. Called after the driver is loaded.
+NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
+{
+	UNREFERENCED_PARAMETER(DriverObject);
+	UNREFERENCED_PARAMETER(RegistryPath);
+
+	DbgPrintEx(0, 0, "~~~ KernelHook driver entry called ~~~\n");
+	DbgPrintEx(0, 0, "~~~ KernelHook driver entry called ~~~\n");
+	DbgPrintEx(0, 0, "~~~ KernelHook driver entry called ~~~\n");
+
+	NTSTATUS status = 0;
+
+	DriverObject->DriverUnload = DriverUnload;
+
+	// routine for handling IO requests from userland
+	DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = IOCTL_DispatchRoutine;
+	// routines that will execute once a handle to our device's symbolik link is opened/closed
+	DriverObject->MajorFunction[IRP_MJ_CREATE] = MajorFunctions;
+	DriverObject->MajorFunction[IRP_MJ_CLOSE] = MajorFunctions;
+
+
+	// called when an image is mapped into memory (loaded)
+	status = PsSetLoadImageNotifyRoutine(LoadImageNotification_Callback);
+	if (!NT_SUCCESS(status))
+	{
+		DbgPrintEx(0, 0, "[Error] - Failed to PsSetLoadImageNotifyRoutine\n");
+		return status;
+	}
+
+	// called when a thread is created or deleted
+	status = PsSetCreateThreadNotifyRoutine(CreateThreadNotification_Callback);
+	if (!NT_SUCCESS(status))
+	{
+		DbgPrintEx(0, 0, "[Error] - Failed to PsSetCreateThreadNotifyRoutine\n");
+		return status;
+	}
+
+	// called when a process is created or exits
+	status = PsSetCreateProcessNotifyRoutineEx(CreateProcessNotification_Callback, FALSE);
+	if (!NT_SUCCESS(status))
+	{
+		DbgPrintEx(0, 0, "[Error] - Failed to PsSetCreateProcessNotifyRoutineEx ~~~\n");
+		return status;
+	}
+
+	// ObRegisterCallback
+	OB_CALLBACK_REGISTRATION obCallbackRegistration = { 0, };
+	OB_OPERATION_REGISTRATION obOperationRegistration = { 0, };
+
+	// "Drivers should specify OB_FLT_REGISTRATION_VERSION": https://docs.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/ns-wdm-_ob_callback_registration
+	obCallbackRegistration.Version = OB_FLT_REGISTRATION_VERSION;
+
+	// OB_OPERATION_REGISTRATION count
+	obCallbackRegistration.OperationRegistrationCount = 1;
+
+	// specifies when to load the driver
+	// the current value is in the load order group: "Activity Monitor" (360000-389999)
+	RtlInitUnicodeString(&obCallbackRegistration.Altitude, L"379482");
+	obCallbackRegistration.RegistrationContext = NULL;
+
+	obOperationRegistration.ObjectType = PsProcessType; // todo there is also PsThreadType and on windows10 there is ExDesktopObjectType
+
+	// operations the pre- and postcallbacks will be called for
+	// it seems there are only OB_OPERATION_HANDLE_CREATE and OB_OPERATION_HANDLE_DUPLICATE
+	// https://docs.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/ns-wdm-_ob_operation_registration
+	obOperationRegistration.Operations = OB_OPERATION_HANDLE_CREATE | OB_OPERATION_HANDLE_DUPLICATE;
+
+	// the pre operation is called before the operation occures
+	obOperationRegistration.PreOperation = PreHandleOperationCallback;
+
+	// the post operaton is called after the operation occured
+	obOperationRegistration.PostOperation = PostHandleOperationCallback;
+
+	obCallbackRegistration.OperationRegistration = &obOperationRegistration;
+
+	// register the callback
+	status = ObRegisterCallbacks(&obCallbackRegistration, &obCallbackRegistrationHandle);
+	if (!NT_SUCCESS(status))
+	{
+		DbgPrintEx(0, 0, "[Error] - Failed ObRegisterCallbacks\n");
+		return status;
+	}
+
+	// create devices for IOTCL TODO new stuff
+	status = IoCreateDevice(DriverObject, 0, &DEVICE_NAME, FILE_DEVICE_UNKNOWN, FILE_DEVICE_SECURE_OPEN, FALSE, &DriverObject->DeviceObject);
+	if (!NT_SUCCESS(status))
+	{
+		DbgPrintEx(0, 0, "Could not create device %wZ\n", DEVICE_NAME);
+		return status;
+	}
+
+	status = IoCreateSymbolicLink(&DEVICE_SYMBOLIC_NAME, &DEVICE_NAME);
+	if (!NT_SUCCESS(status))
+	{
+		DbgPrintEx(0, 0, "Error creating symbolic link %wZ\n", DEVICE_SYMBOLIC_NAME);
+		return status;
+	}
+
+	return STATUS_SUCCESS;
+}
