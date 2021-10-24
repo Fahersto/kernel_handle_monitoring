@@ -1,11 +1,28 @@
 #include <ntifs.h>
 #include <ntddk.h>
 
-// DebugView
-// registry key to see debug messages (on target machine): reg add "HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Debug Print Filter" /t REG_DWORD /d 0xf
-// currently debbuging with VS will only work once.. then the VM needs to be resetted to a snapshot
-// PsSetCreateProcessNotifyRoutineEx requires "/integritycheck" as linker argument to work properly
+#include "Util.h"
 
+#define LDRP_VALID_SECTION 0x20
+#pragma warning(disable : 4047)  
+
+typedef NTSTATUS(__fastcall* MiProcessLoaderEntry)(PVOID pDriverSection, int bLoad);
+
+MiProcessLoaderEntry g_pfnMiProcessLoaderEntry = NULL;
+
+extern "C" NTSTATUS
+IoCreateDriver(
+	IN  PUNICODE_STRING DriverName    OPTIONAL,
+	IN  PDRIVER_INITIALIZE InitializationFunction
+);
+
+
+NTSTATUS RealEntry(
+	PDRIVER_OBJECT  DriverObject,
+	PUNICODE_STRING registry_path
+);
+
+/**/
 DRIVER_DISPATCH IOCTL_DispatchRoutine;
 
 #define IOCTL_MONITOR_HANDLES_OF_PROCESS  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x4711, METHOD_BUFFERED, FILE_ANY_ACCESS)
@@ -25,6 +42,41 @@ BOOLEAN monitorHandleOperationPostCallback = 0;
 PVOID obCallbackRegistrationHandle = NULL;
 
 HANDLE currentlyMonitoredProcess = NULL;
+extern POBJECT_TYPE* IoDriverObjectType;
+
+typedef struct _KLDR_DATA_TABLE_ENTRY
+{
+	LIST_ENTRY InLoadOrderLinks;
+	PVOID ExceptionTable;
+	UINT32 ExceptionTableSize;
+	PVOID GpValue;
+	struct _NON_PAGED_DEBUG_INFO* NonPagedDebugInfo;
+	PVOID ImageBase;
+	PVOID EntryPoint;
+	UINT32 SizeOfImage;
+	UNICODE_STRING FullImageName;
+	UNICODE_STRING BaseImageName;
+	UINT32 Flags;
+	UINT16 LoadCount;
+
+	union
+	{
+		UINT16 SignatureLevel : 4;
+		UINT16 SignatureType : 3;
+		UINT16 Unused : 9;
+		UINT16 EntireField;
+	} u;
+
+	PVOID SectionPointer;
+	UINT32 CheckSum;
+	UINT32 CoverageSectionSize;
+	PVOID CoverageSection;
+	PVOID LoadedImports;
+	PVOID Spare;
+	UINT32 SizeOfImageNotRounded;
+	UINT32 TimeDateStamp;
+} KLDR_DATA_TABLE_ENTRY, * PKLDR_DATA_TABLE_ENTRY;
+
 
 NTSTATUS IOCTL_DispatchRoutine(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
@@ -39,7 +91,7 @@ NTSTATUS IOCTL_DispatchRoutine(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 	{
 		DbgPrintEx(0, 0, "[Info] - Received IOCTL_MONITOR_HANDLES_OF_PROCESS %lx\n", stackLocation->Parameters.DeviceIoControl.IoControlCode);
 
-		PHANDLE handle = Irp->AssociatedIrp.SystemBuffer;
+		PHANDLE handle = (PHANDLE)Irp->AssociatedIrp.SystemBuffer;
 		DbgPrintEx(0, 0, "\tMonitor process %p\n", *handle);
 
 		PEPROCESS process = NULL;
@@ -167,6 +219,8 @@ OB_PREOP_CALLBACK_STATUS PreHandleOperationCallback(PVOID RegistrationContext, P
 {
 	UNREFERENCED_PARAMETER(RegistrationContext);
 
+	DbgPrintEx(0, 0, "~~~ PreHandleOperationCallback ~~~\n");
+
 	if (!monitorHandleOperationPreCallback)
 	{
 		return OB_PREOP_SUCCESS;
@@ -198,7 +252,7 @@ OB_PREOP_CALLBACK_STATUS PreHandleOperationCallback(PVOID RegistrationContext, P
 		if (targetObjectType == *PsProcessType)
 		{
 			PUNICODE_STRING processName = NULL;
-			GetProcessNameFromId(PsGetProcessId(targetObject), &processName);
+			GetProcessNameFromId(PsGetProcessId((PEPROCESS)targetObject), &processName);
 
 			DbgPrintEx(0, 0, "\tCreating handle to process %wZ(%p) with access %lx\n", processName, targetObject, desiredAccess);
 		}
@@ -226,13 +280,13 @@ OB_PREOP_CALLBACK_STATUS PreHandleOperationCallback(PVOID RegistrationContext, P
 		DbgPrintEx(0, 0, "[Info] - Handle operation PreCallback - %wZ\n", currentProcessName);
 
 		PUNICODE_STRING processName = NULL;
-		GetProcessNameFromId(PsGetProcessId(targetObject), &processName);
+		GetProcessNameFromId(PsGetProcessId((PEPROCESS)targetObject), &processName);
 
 		PUNICODE_STRING sourceProcessName = NULL;
-		GetProcessNameFromId(PsGetProcessId(sourceProcess), &sourceProcessName);
+		GetProcessNameFromId(PsGetProcessId((PEPROCESS)sourceProcess), &sourceProcessName);
 
 		PUNICODE_STRING targetProcessName = NULL;
-		GetProcessNameFromId(PsGetProcessId(targetProcess), &targetProcessName);
+		GetProcessNameFromId(PsGetProcessId((PEPROCESS)targetProcess), &targetProcessName);
 
 		if (targetObjectType == *PsProcessType)
 		{
@@ -275,15 +329,213 @@ void DriverUnload(PDRIVER_OBJECT dob)
 	IoDeleteSymbolicLink(&DEVICE_SYMBOLIC_NAME);
 }
 
-// Entry function. Called after the driver is loaded.
-NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
+typedef struct _DEVICE_MAP* PDEVICE_MAP;
+
+typedef struct _OBJECT_DIRECTORY_ENTRY
 {
-	UNREFERENCED_PARAMETER(DriverObject);
-	UNREFERENCED_PARAMETER(RegistryPath);
+	_OBJECT_DIRECTORY_ENTRY* ChainLink;
+	PVOID Object;
+	ULONG HashValue;
+} OBJECT_DIRECTORY_ENTRY, * POBJECT_DIRECTORY_ENTRY;
+
+typedef struct _OBJECT_DIRECTORY
+{
+	POBJECT_DIRECTORY_ENTRY HashBuckets[37];
+	EX_PUSH_LOCK Lock;
+	PDEVICE_MAP DeviceMap;
+	ULONG SessionId;
+	PVOID NamespaceEntry;
+	ULONG Flags;
+} OBJECT_DIRECTORY, * POBJECT_DIRECTORY;
+
+extern "C" PDRIVER_OBJECT FindDriver(PUNICODE_STRING targetName)
+{
+	HANDLE handle{};
+	OBJECT_ATTRIBUTES attributes{};
+	UNICODE_STRING directory_name{};
+	PVOID directory{};
+	BOOLEAN success = FALSE;
+
+	RtlInitUnicodeString(&directory_name, L"\\Driver");
+	InitializeObjectAttributes(&attributes, &directory_name, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+	// open OBJECT_DIRECTORY for \Driver
+	auto status = ZwOpenDirectoryObject(&handle, DIRECTORY_ALL_ACCESS, &attributes);
+
+	if (!NT_SUCCESS(status))
+	{
+		return nullptr;
+	}
+
+	DbgPrintEx(0, 0, "[Info] - ZwOpenDirectoryObject\n");
+
+	// Get OBJECT_DIRECTORY pointer from HANDLE
+	status = ObReferenceObjectByHandle(handle, DIRECTORY_ALL_ACCESS, nullptr, KernelMode, &directory, nullptr);
+
+	if (!NT_SUCCESS(status)) {
+		ZwClose(handle);
+		return nullptr;
+	}
+
+	DbgPrintEx(0, 0, "[Info] - ObReferenceObjectByHandle\n");
+
+	const auto directory_object = POBJECT_DIRECTORY(directory);
+
+	ExAcquirePushLockExclusiveEx(&directory_object->Lock, 0);
+
+	// traverse hash table with 37 entries
+	// when a new object is created, the object manager computes a hash value in the range zero to 36 from the object name and creates an OBJECT_DIRECTORY_ENTRY.    
+	// http://www.informit.com/articles/article.aspx?p=22443&seqNum=7
+	for (auto entry : directory_object->HashBuckets)
+	{
+		if (entry == nullptr)
+			continue;
+
+		if (success == TRUE)
+			break;
+
+		while (entry != nullptr && entry->Object != nullptr)
+		{
+			// You could add type checking here with ObGetObjectType but if that's wrong we're gonna bsod anyway :P
+			auto driver = PDRIVER_OBJECT(entry->Object);
+
+			if (targetName && RtlCompareUnicodeString(&driver->DriverName, targetName, FALSE) == 0)
+			{
+				DbgPrintEx(0, 0, "FOUND Driver %wZ at %p\n", targetName, driver);
+				
+				ExReleasePushLockExclusiveEx(&directory_object->Lock, 0);
+
+				// Release the acquired resources back to the OS
+				ObDereferenceObject(directory);
+				ZwClose(handle);
+
+				return driver;
+			}
+
+			/*
+			if (ignore != nullptr)
+			{
+				if (RtlCompareUnicodeString(&driver->DriverName, &ignore->DriverName, FALSE) == 0)
+				{
+					entry = entry->ChainLink;
+					continue;
+				}
+			}
+
+			if (NT_SUCCESS(HijackDriver(driver)))
+			{
+				success = TRUE;
+				break;
+			}
+			*/
+			DbgPrintEx(0, 0, "\tDriver %wZ at %p\n", driver->DriverName, driver);
+			if (driver && driver->DeviceObject)
+			{
+				DbgPrintEx(0, 0, "\tDeviceObject at %p\n", driver->DeviceObject);
+				if (driver && driver->DeviceObject)
+				{
+					DbgPrintEx(0, 0, "\t\tflags at %lx\n", driver->DeviceObject->Flags);
+					if (driver->DeviceObject->Flags & 0x20)
+					{
+						DbgPrintEx(0, 0, "~~~ MAAAAAAAAAAAAATCH ~~~~~~\n");
+					}
+				}
+			}
+			entry = entry->ChainLink;
+		}
+
+	}
+
+	ExReleasePushLockExclusiveEx(&directory_object->Lock, 0);
+
+	// Release the acquired resources back to the OS
+	ObDereferenceObject(directory);
+	ZwClose(handle);
+
+	return nullptr;
+}
+
+typedef NTSTATUS(NTAPI OBREFERENCEOBJECTBYNAME) (
+	PUNICODE_STRING ObjectPath,
+	ULONG Attributes,
+	PACCESS_STATE PassedAccessState OPTIONAL,
+	ACCESS_MASK DesiredAccess OPTIONAL,
+	POBJECT_TYPE ObjectType,
+	KPROCESSOR_MODE AccessMode,
+	PVOID ParseContext OPTIONAL,
+	PVOID* ObjectPtr);
+
+extern "C"
+NTSTATUS
+NTAPI
+ObReferenceObjectByName(
+	PUNICODE_STRING ObjectName,
+	ULONG Attributes,
+	PACCESS_STATE Passed,
+	ACCESS_MASK DesiredAccess,
+	POBJECT_TYPE ObjectType,
+	KPROCESSOR_MODE Access,
+	PVOID ParseContext,
+	PVOID* ObjectPtr
+);
+POBJECT_TYPE* IoDriverObjectType;
+
+PDRIVER_OBJECT GetDriverObject(PUNICODE_STRING DriverName)
+{
+	PDRIVER_OBJECT DrvObject;
+	if (NT_SUCCESS(ObReferenceObjectByName(DriverName, 0, NULL, 0, NULL, KernelMode, NULL, (PVOID*)&DrvObject)))
+	{
+		return DrvObject;
+	}
+
+	return NULL;
+}
+
+NTSTATUS RealEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING registry_path)
+{
+	//UNREFERENCED_PARAMETER(DriverObject);
+	UNREFERENCED_PARAMETER(registry_path);
 
 	DbgPrintEx(0, 0, "~~~ KernelHook driver entry called ~~~\n");
 	DbgPrintEx(0, 0, "~~~ KernelHook driver entry called ~~~\n");
 	DbgPrintEx(0, 0, "~~~ KernelHook driver entry called ~~~\n");
+
+	DbgPrintEx(0, 0, "~~~ Driver object %p ~~~\n", DriverObject);
+	DbgPrintEx(0, 0, "~~~ Driver section %p ~~~\n", DriverObject->DriverSection);
+
+	void* kernelBase = get_kernel_base();
+	DbgPrintEx(0, 0, "~~~ kernelBase %p ~~~\n", kernelBase);
+
+	//PVOID MiProcessLoaderEntryAddress = (char*)kernelBase + 0x160D08;
+	//DbgPrintEx(0, 0, "~~~ MiProcessLoaderEntry %p ~~~\n", MiProcessLoaderEntryAddress);
+
+	//PKLDR_DATA_TABLE_ENTRY driverSection = (PKLDR_DATA_TABLE_ENTRY )ExAllocatePoolWithTag(PagedPool, sizeof(KLDR_DATA_TABLE_ENTRY), 'Tag1');
+	//driverSection->Flags |= 0x20;
+	//DriverObject->DriverSection = driverSection;
+
+	//oldest 0x165F56
+	//driver dev: 610A1A
+	PVOID jmpRcx = (char*)kernelBase + 0x610A1A;
+
+
+	DbgPrintEx(0, 0, "~~~ jmpRcx %p ~~~\n", jmpRcx);
+
+	UNICODE_STRING  drvName;
+	RtlInitUnicodeString(&drvName, L"\\Driver\\DXGKrnl");
+	auto driver = FindDriver(&drvName);
+
+	PKLDR_DATA_TABLE_ENTRY DriverSection = (PKLDR_DATA_TABLE_ENTRY)driver->DriverSection;
+
+	DbgPrintEx(0, 0, "~~~ flags %x ~~~\n", DriverSection->Flags);
+	//DriverSection->Flags |= LDRP_VALID_SECTION;
+	DbgPrintEx(0, 0, "~~~ flags %x ~~~\n", DriverSection->Flags);
+
+
+	jmpRcx = (char*)driver->DriverStart + 0xD7C4B;
+	DbgPrintEx(0, 0, "~~~ driver jmpRcx %p ~~~\n", jmpRcx);
+	// \SystemRoot\System32\drivers\dxgkrnl.sys
+
+
 
 	NTSTATUS status = 0;
 
@@ -295,31 +547,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 	DriverObject->MajorFunction[IRP_MJ_CREATE] = MajorFunctions;
 	DriverObject->MajorFunction[IRP_MJ_CLOSE] = MajorFunctions;
 
-
-	// called when an image is mapped into memory (loaded)
-	status = PsSetLoadImageNotifyRoutine(LoadImageNotification_Callback);
-	if (!NT_SUCCESS(status))
-	{
-		DbgPrintEx(0, 0, "[Error] - Failed to PsSetLoadImageNotifyRoutine\n");
-		return status;
-	}
-
-	// called when a thread is created or deleted
-	status = PsSetCreateThreadNotifyRoutine(CreateThreadNotification_Callback);
-	if (!NT_SUCCESS(status))
-	{
-		DbgPrintEx(0, 0, "[Error] - Failed to PsSetCreateThreadNotifyRoutine\n");
-		return status;
-	}
-
-	// called when a process is created or exits
-	status = PsSetCreateProcessNotifyRoutineEx(CreateProcessNotification_Callback, FALSE);
-	if (!NT_SUCCESS(status))
-	{
-		DbgPrintEx(0, 0, "[Error] - Failed to PsSetCreateProcessNotifyRoutineEx ~~~\n");
-		return status;
-	}
-
+	
 	// ObRegisterCallback
 	OB_CALLBACK_REGISTRATION obCallbackRegistration = { 0, };
 	OB_OPERATION_REGISTRATION obOperationRegistration = { 0, };
@@ -333,20 +561,20 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 	// specifies when to load the driver
 	// the current value is in the load order group: "Activity Monitor" (360000-389999)
 	RtlInitUnicodeString(&obCallbackRegistration.Altitude, L"379482");
-	obCallbackRegistration.RegistrationContext = NULL;
+	obCallbackRegistration.RegistrationContext = (PVOID)PreHandleOperationCallback;
 
 	obOperationRegistration.ObjectType = PsProcessType; // todo there is also PsThreadType and on windows10 there is ExDesktopObjectType
 
 	// operations the pre- and postcallbacks will be called for
 	// it seems there are only OB_OPERATION_HANDLE_CREATE and OB_OPERATION_HANDLE_DUPLICATE
 	// https://docs.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/ns-wdm-_ob_operation_registration
-	obOperationRegistration.Operations = OB_OPERATION_HANDLE_CREATE | OB_OPERATION_HANDLE_DUPLICATE;
+	obOperationRegistration.Operations = OB_OPERATION_HANDLE_CREATE;
 
 	// the pre operation is called before the operation occures
-	obOperationRegistration.PreOperation = PreHandleOperationCallback;
+	obOperationRegistration.PreOperation = (POB_PRE_OPERATION_CALLBACK)jmpRcx;
 
 	// the post operaton is called after the operation occured
-	obOperationRegistration.PostOperation = PostHandleOperationCallback;
+	//obOperationRegistration.PostOperation = (POB_POST_OPERATION_CALLBACK)jmpRcx;
 
 	obCallbackRegistration.OperationRegistration = &obOperationRegistration;
 
@@ -354,7 +582,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 	status = ObRegisterCallbacks(&obCallbackRegistration, &obCallbackRegistrationHandle);
 	if (!NT_SUCCESS(status))
 	{
-		DbgPrintEx(0, 0, "[Error] - Failed ObRegisterCallbacks\n");
+		DbgPrintEx(0, 0, "[Error] - Failed ObRegisterCallbacks: %x\n", status);
 		return status;
 	}
 
@@ -373,5 +601,27 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 		return status;
 	}
 
+
+	return STATUS_SUCCESS;
+}
+
+NTSTATUS DriverEntry(
+	PDRIVER_OBJECT  driver_object,
+	PUNICODE_STRING registry_path
+)
+{
+	// These are invalid for mapped drivers.
+	UNREFERENCED_PARAMETER(driver_object);
+	UNREFERENCED_PARAMETER(registry_path);
+
+	NTSTATUS        status;
+	UNICODE_STRING  drvName;
+	RtlInitUnicodeString(&drvName, L"\\Driver\\CIKHDriver");
+	status = IoCreateDriver(&drvName, &RealEntry);
+	if (!NT_SUCCESS(status))
+	{
+		DbgPrintEx(0, 0, "[Error] - IoCreateDriver: %x\n", status);
+		return status;
+	}
 	return STATUS_SUCCESS;
 }

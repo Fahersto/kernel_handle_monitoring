@@ -24,8 +24,18 @@
     </Inf>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="kernelHook.c">
+    <ClCompile Include="kernelHook.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <Text Include="kdmappable_but_not_working_because_not_signed.txt">
+      <Filter>Source Files</Filter>
+    </Text>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="Util.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
 </Project>
