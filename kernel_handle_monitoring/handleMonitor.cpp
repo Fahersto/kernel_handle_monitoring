@@ -19,7 +19,7 @@ int main(char argc, char** argv)
     PHANDLE pTargetProcessId = (PHANDLE)&targetProcessId;
 
     // open I/O device created by the driver
-    HANDLE ioDevice = CreateFileW(L"\\\\.\\CIKHDeviceLink", GENERIC_ALL, 0, 0, OPEN_EXISTING, FILE_ATTRIBUTE_SYSTEM, 0);
+    HANDLE ioDevice = CreateFileA("\\\\.\\cikhlink", GENERIC_READ, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (ioDevice == INVALID_HANDLE_VALUE)
     {
         printf("Error %d - Failed to open driver device", GetLastError());

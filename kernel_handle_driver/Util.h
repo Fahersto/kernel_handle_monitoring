@@ -106,7 +106,7 @@ extern "C" NTSTATUS ZwQuerySystemInformation(ULONG InfoClass, PVOID Buffer, ULON
 
 
 // this implementations works with kdmapped
-// stolen from: https://github.com/NMan1/OverflowRust/blob/master/OverflowDriver/cleaner.h
+// based on: https://github.com/NMan1/OverflowRust/blob/master/OverflowDriver/cleaner.h
 PVOID get_kernel_base()
 {
 	NTSTATUS status = STATUS_SUCCESS;
@@ -120,13 +120,16 @@ PVOID get_kernel_base()
 
 	checkPtr = MmGetSystemRoutineAddress(&routineName);
 	if (checkPtr == NULL)
+	{
 		return NULL;
-
+	}
 
 	status = ZwQuerySystemInformation(SystemModuleInformation, 0, bytes, &bytes);
 
 	if (bytes == 0)
+	{
 		return NULL;
+	}
 
 	pMods = (PRTL_PROCESS_MODULES)ExAllocatePoolWithTag(NonPagedPool, bytes, 0x454E4F45); // 'ENON'
 	RtlZeroMemory(pMods, bytes);
@@ -157,7 +160,9 @@ PVOID get_kernel_base()
 	}
 
 	if (pMods)
+	{
 		ExFreePoolWithTag(pMods, 0x454E4F45); // 'ENON'
+	}
 
 	return ImageBase;
 }

@@ -3,32 +3,16 @@
 
 #include "Util.h"
 
-#define LDRP_VALID_SECTION 0x20
-#pragma warning(disable : 4047)  
 
-typedef NTSTATUS(__fastcall* MiProcessLoaderEntry)(PVOID pDriverSection, int bLoad);
-
-MiProcessLoaderEntry g_pfnMiProcessLoaderEntry = NULL;
-
-extern "C" NTSTATUS
-IoCreateDriver(
-	IN  PUNICODE_STRING DriverName    OPTIONAL,
-	IN  PDRIVER_INITIALIZE InitializationFunction
-);
-
-
-NTSTATUS RealEntry(
-	PDRIVER_OBJECT  DriverObject,
-	PUNICODE_STRING registry_path
-);
+extern "C" NTSTATUS IoCreateDriver(IN PUNICODE_STRING DriverName OPTIONAL, IN PDRIVER_INITIALIZE InitializationFunction);
 
 /**/
 DRIVER_DISPATCH IOCTL_DispatchRoutine;
 
 #define IOCTL_MONITOR_HANDLES_OF_PROCESS  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x4711, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
-UNICODE_STRING DEVICE_NAME = RTL_CONSTANT_STRING(L"\\Device\\CIKHDevice");
-UNICODE_STRING DEVICE_SYMBOLIC_NAME = RTL_CONSTANT_STRING(L"\\??\\CIKHDeviceLink");
+//UNICODE_STRING DEVICE_NAME = RTL_CONSTANT_STRING(L"\\Device\\cikhdriver");
+//UNICODE_STRING DEVICE_SYMBOLIC_NAME = RTL_CONSTANT_STRING(L"\\DosDevices\\cikhdriver");
 
 // Kernel-Mode Process and Thread Manager callbacks
 BOOLEAN monitorThreadCreation = 0;
@@ -86,6 +70,8 @@ NTSTATUS IOCTL_DispatchRoutine(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 	CHAR* errorMessage = "[Error] - Driver could not find processId";
 	CHAR* message = "hi";
 
+	DbgPrintEx(0, 0, "[Info] - IOCTL_DispatchRoutine\n");
+
 	stackLocation = IoGetCurrentIrpStackLocation(Irp);
 	if (stackLocation->Parameters.DeviceIoControl.IoControlCode == IOCTL_MONITOR_HANDLES_OF_PROCESS)
 	{
@@ -118,7 +104,7 @@ NTSTATUS IOCTL_DispatchRoutine(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 	IoCompleteRequest(Irp, IO_NO_INCREMENT);
 	return STATUS_SUCCESS;
 }
-
+/*
 NTSTATUS MajorFunctions(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
 	UNREFERENCED_PARAMETER(DeviceObject);
@@ -127,10 +113,10 @@ NTSTATUS MajorFunctions(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 	switch (stackLocation->MajorFunction)
 	{
 	case IRP_MJ_CREATE:
-		DbgPrintEx(0, 0, "Handle to symbolink link %wZ opened\n", DEVICE_SYMBOLIC_NAME);
+		DbgPrintEx(0, 0, "Handle to symbolink link opened\n");
 		break;
 	case IRP_MJ_CLOSE:
-		DbgPrintEx(0, 0, "Handle to symbolink link %wZ closed\n", DEVICE_SYMBOLIC_NAME);
+		DbgPrintEx(0, 0, "Handle to symbolink link closed\n");
 		break;
 	default:
 		break;
@@ -138,6 +124,25 @@ NTSTATUS MajorFunctions(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 	Irp->IoStatus.Status = STATUS_SUCCESS;
 	IoCompleteRequest(Irp, IO_NO_INCREMENT);
 	return STATUS_SUCCESS;
+}
+*/
+
+NTSTATUS create_io(PDEVICE_OBJECT device_obj, PIRP irp) {
+	UNREFERENCED_PARAMETER(device_obj);
+
+	DbgPrintEx(0, 0, "[Info] - IOCTL create\n");
+
+	IoCompleteRequest(irp, IO_NO_INCREMENT);
+	return irp->IoStatus.Status;
+}
+
+NTSTATUS close_io(PDEVICE_OBJECT device_obj, PIRP irp) {
+	UNREFERENCED_PARAMETER(device_obj);
+
+	DbgPrintEx(0, 0, "[Info] - IOCTL close\n");
+
+	IoCompleteRequest(irp, IO_NO_INCREMENT);
+	return irp->IoStatus.Status;
 }
 
 // called when a thread is created or deleted
@@ -219,7 +224,7 @@ OB_PREOP_CALLBACK_STATUS PreHandleOperationCallback(PVOID RegistrationContext, P
 {
 	UNREFERENCED_PARAMETER(RegistrationContext);
 
-	DbgPrintEx(0, 0, "~~~ PreHandleOperationCallback ~~~\n");
+	//DbgPrintEx(0, 0, "~~~ PreHandleOperationCallback ~~~\n");
 
 	if (!monitorHandleOperationPreCallback)
 	{
@@ -325,8 +330,8 @@ void DriverUnload(PDRIVER_OBJECT dob)
 	PsRemoveLoadImageNotifyRoutine(LoadImageNotification_Callback);
 	ObUnRegisterCallbacks(obCallbackRegistrationHandle);
 
-	IoDeleteDevice(dob->DeviceObject);
-	IoDeleteSymbolicLink(&DEVICE_SYMBOLIC_NAME);
+	//IoDeleteDevice(dob->DeviceObject);
+	//IoDeleteSymbolicLink(&DEVICE_SYMBOLIC_NAME);
 }
 
 typedef struct _DEVICE_MAP* PDEVICE_MAP;
@@ -348,6 +353,8 @@ typedef struct _OBJECT_DIRECTORY
 	ULONG Flags;
 } OBJECT_DIRECTORY, * POBJECT_DIRECTORY;
 
+
+// based on https://github.com/not-wlan/driver-hijack
 extern "C" PDRIVER_OBJECT FindDriver(PUNICODE_STRING targetName)
 {
 	HANDLE handle{};
@@ -364,20 +371,19 @@ extern "C" PDRIVER_OBJECT FindDriver(PUNICODE_STRING targetName)
 
 	if (!NT_SUCCESS(status))
 	{
+		DbgPrintEx(0, 0, "[Error] - Failed to ZwOpenDirectoryObject %x\n", status);
 		return nullptr;
 	}
-
-	DbgPrintEx(0, 0, "[Info] - ZwOpenDirectoryObject\n");
 
 	// Get OBJECT_DIRECTORY pointer from HANDLE
 	status = ObReferenceObjectByHandle(handle, DIRECTORY_ALL_ACCESS, nullptr, KernelMode, &directory, nullptr);
 
-	if (!NT_SUCCESS(status)) {
+	if (!NT_SUCCESS(status)) 
+	{
+		DbgPrintEx(0, 0, "[Error] - Failed to ObReferenceObjectByHandle %x\n", status);
 		ZwClose(handle);
 		return nullptr;
 	}
-
-	DbgPrintEx(0, 0, "[Info] - ObReferenceObjectByHandle\n");
 
 	const auto directory_object = POBJECT_DIRECTORY(directory);
 
@@ -401,8 +407,6 @@ extern "C" PDRIVER_OBJECT FindDriver(PUNICODE_STRING targetName)
 
 			if (targetName && RtlCompareUnicodeString(&driver->DriverName, targetName, FALSE) == 0)
 			{
-				DbgPrintEx(0, 0, "FOUND Driver %wZ at %p\n", targetName, driver);
-				
 				ExReleasePushLockExclusiveEx(&directory_object->Lock, 0);
 
 				// Release the acquired resources back to the OS
@@ -413,21 +417,6 @@ extern "C" PDRIVER_OBJECT FindDriver(PUNICODE_STRING targetName)
 			}
 
 			/*
-			if (ignore != nullptr)
-			{
-				if (RtlCompareUnicodeString(&driver->DriverName, &ignore->DriverName, FALSE) == 0)
-				{
-					entry = entry->ChainLink;
-					continue;
-				}
-			}
-
-			if (NT_SUCCESS(HijackDriver(driver)))
-			{
-				success = TRUE;
-				break;
-			}
-			*/
 			DbgPrintEx(0, 0, "\tDriver %wZ at %p\n", driver->DriverName, driver);
 			if (driver && driver->DeviceObject)
 			{
@@ -440,7 +429,7 @@ extern "C" PDRIVER_OBJECT FindDriver(PUNICODE_STRING targetName)
 						DbgPrintEx(0, 0, "~~~ MAAAAAAAAAAAAATCH ~~~~~~\n");
 					}
 				}
-			}
+			}*/
 			entry = entry->ChainLink;
 		}
 
@@ -455,99 +444,67 @@ extern "C" PDRIVER_OBJECT FindDriver(PUNICODE_STRING targetName)
 	return nullptr;
 }
 
-typedef NTSTATUS(NTAPI OBREFERENCEOBJECTBYNAME) (
-	PUNICODE_STRING ObjectPath,
-	ULONG Attributes,
-	PACCESS_STATE PassedAccessState OPTIONAL,
-	ACCESS_MASK DesiredAccess OPTIONAL,
-	POBJECT_TYPE ObjectType,
-	KPROCESSOR_MODE AccessMode,
-	PVOID ParseContext OPTIONAL,
-	PVOID* ObjectPtr);
+NTSTATUS unsupported_io(PDEVICE_OBJECT device_obj, PIRP irp) {
+	UNREFERENCED_PARAMETER(device_obj);
 
-extern "C"
-NTSTATUS
-NTAPI
-ObReferenceObjectByName(
-	PUNICODE_STRING ObjectName,
-	ULONG Attributes,
-	PACCESS_STATE Passed,
-	ACCESS_MASK DesiredAccess,
-	POBJECT_TYPE ObjectType,
-	KPROCESSOR_MODE Access,
-	PVOID ParseContext,
-	PVOID* ObjectPtr
-);
-POBJECT_TYPE* IoDriverObjectType;
-
-PDRIVER_OBJECT GetDriverObject(PUNICODE_STRING DriverName)
-{
-	PDRIVER_OBJECT DrvObject;
-	if (NT_SUCCESS(ObReferenceObjectByName(DriverName, 0, NULL, 0, NULL, KernelMode, NULL, (PVOID*)&DrvObject)))
-	{
-		return DrvObject;
-	}
-
-	return NULL;
+	irp->IoStatus.Status = STATUS_NOT_SUPPORTED;
+	IoCompleteRequest(irp, IO_NO_INCREMENT);
+	return irp->IoStatus.Status;
 }
 
-NTSTATUS RealEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING registry_path)
+NTSTATUS RealEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 {
 	//UNREFERENCED_PARAMETER(DriverObject);
-	UNREFERENCED_PARAMETER(registry_path);
-
-	DbgPrintEx(0, 0, "~~~ KernelHook driver entry called ~~~\n");
-	DbgPrintEx(0, 0, "~~~ KernelHook driver entry called ~~~\n");
-	DbgPrintEx(0, 0, "~~~ KernelHook driver entry called ~~~\n");
-
-	DbgPrintEx(0, 0, "~~~ Driver object %p ~~~\n", DriverObject);
-	DbgPrintEx(0, 0, "~~~ Driver section %p ~~~\n", DriverObject->DriverSection);
-
-	void* kernelBase = get_kernel_base();
-	DbgPrintEx(0, 0, "~~~ kernelBase %p ~~~\n", kernelBase);
-
-	//PVOID MiProcessLoaderEntryAddress = (char*)kernelBase + 0x160D08;
-	//DbgPrintEx(0, 0, "~~~ MiProcessLoaderEntry %p ~~~\n", MiProcessLoaderEntryAddress);
-
-	//PKLDR_DATA_TABLE_ENTRY driverSection = (PKLDR_DATA_TABLE_ENTRY )ExAllocatePoolWithTag(PagedPool, sizeof(KLDR_DATA_TABLE_ENTRY), 'Tag1');
-	//driverSection->Flags |= 0x20;
-	//DriverObject->DriverSection = driverSection;
-
-	//oldest 0x165F56
-	//driver dev: 610A1A
-	PVOID jmpRcx = (char*)kernelBase + 0x610A1A;
-
-
-	DbgPrintEx(0, 0, "~~~ jmpRcx %p ~~~\n", jmpRcx);
-
-	UNICODE_STRING  drvName;
-	RtlInitUnicodeString(&drvName, L"\\Driver\\DXGKrnl");
-	auto driver = FindDriver(&drvName);
-
-	PKLDR_DATA_TABLE_ENTRY DriverSection = (PKLDR_DATA_TABLE_ENTRY)driver->DriverSection;
-
-	DbgPrintEx(0, 0, "~~~ flags %x ~~~\n", DriverSection->Flags);
-	//DriverSection->Flags |= LDRP_VALID_SECTION;
-	DbgPrintEx(0, 0, "~~~ flags %x ~~~\n", DriverSection->Flags);
-
-
-	jmpRcx = (char*)driver->DriverStart + 0xD7C4B;
-	DbgPrintEx(0, 0, "~~~ driver jmpRcx %p ~~~\n", jmpRcx);
-	// \SystemRoot\System32\drivers\dxgkrnl.sys
-
-
+	UNREFERENCED_PARAMETER(RegistryPath);
 
 	NTSTATUS status = 0;
 
-	DriverObject->DriverUnload = DriverUnload;
+	DbgPrintEx(0, 0, "[Info] - RealEntry called\n");
+	DbgPrintEx(0, 0, "\tDriver object %p\n", DriverObject);
 
-	// routine for handling IO requests from userland
-	DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = IOCTL_DispatchRoutine;
-	// routines that will execute once a handle to our device's symbolik link is opened/closed
-	DriverObject->MajorFunction[IRP_MJ_CREATE] = MajorFunctions;
-	DriverObject->MajorFunction[IRP_MJ_CLOSE] = MajorFunctions;
+	// when mapped with kdmapper it is expected that DriverSection is NULL
+	// this serves as a reminder, that we don't have a valid driver when mapping it
+	DbgPrintEx(0, 0, "\tDriver section %p\n", DriverObject->DriverSection);
 
-	
+	UNICODE_STRING  drvName;
+	RtlInitUnicodeString(&drvName, L"\\Driver\\DXGKrnl");
+	auto targetDriver = FindDriver(&drvName);
+
+	if (!targetDriver)
+	{
+		DbgPrintEx(0, 0, "[Error] - Failed to find driver %wZ\n", drvName);
+		return STATUS_UNSUCCESSFUL;
+	}
+
+	DbgPrintEx(0, 0, "[Info] - Found driver %wZ at %p\n", targetDriver->DriverName, targetDriver);
+
+	PKLDR_DATA_TABLE_ENTRY targetDriverSection = (PKLDR_DATA_TABLE_ENTRY)targetDriver->DriverSection;
+
+	// we need the 0x20 flag to be set to be able to register ObRegisterCallbacks
+	// ObRegisterCallbacks calls MmVerifyCallbackFunctionCheckFlags which checks for the 0x20 flag
+	// MmVerifyCallbackFunctionCheckFlags will look up in which PDRIVER_OBJECT the supplied callbacks (pre and post callbacks) are located
+	//	and check the flags of that PDRIVER_OBJECT->DriverSection for 0x20 
+	DbgPrintEx(0, 0, "[Info] - PKLDR_DATA_TABLE_ENTRY flags %x\n", targetDriverSection->Flags);
+
+	PVOID jmpRcx = nullptr;
+	unsigned char* currentAddress = (unsigned char*)targetDriver->DriverStart;
+	for (int i = 0; i < 0x100000; i++)
+	{
+		// FF E1  jmp rcx
+		if (currentAddress[i] == 0xff && currentAddress[i+1] == 0xe1)
+		{
+			jmpRcx = currentAddress + i;
+			DbgPrintEx(0, 0, "[Info] - Found \"jmp rcx\" at %p\n", currentAddress);
+			break;
+		}
+	}
+
+	if (!jmpRcx)
+	{
+		DbgPrintEx(0, 0, "[Error] - Failed to find \"jmp rcx\" in %wZ\n", targetDriver->DriverName);
+		return STATUS_UNSUCCESSFUL;
+	}
+
 	// ObRegisterCallback
 	OB_CALLBACK_REGISTRATION obCallbackRegistration = { 0, };
 	OB_OPERATION_REGISTRATION obOperationRegistration = { 0, };
@@ -586,41 +543,64 @@ NTSTATUS RealEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING registry_path)
 		return status;
 	}
 
-	// create devices for IOTCL TODO new stuff
-	status = IoCreateDevice(DriverObject, 0, &DEVICE_NAME, FILE_DEVICE_UNKNOWN, FILE_DEVICE_SECURE_OPEN, FALSE, &DriverObject->DeviceObject);
+	DbgPrintEx(0, 0, "[Info] - ObRegisterCallbacks success\n");
+
+	PDEVICE_OBJECT dev_obj;
+	UNICODE_STRING dev_name, sym_link;
+	RtlInitUnicodeString(&dev_name, L"\\Device\\cikhdevice");
+
+	status = IoCreateDevice(DriverObject, 0, &dev_name, FILE_DEVICE_UNKNOWN, FILE_DEVICE_SECURE_OPEN, FALSE, &dev_obj);
 	if (!NT_SUCCESS(status))
 	{
-		DbgPrintEx(0, 0, "Could not create device %wZ\n", DEVICE_NAME);
+		DbgPrintEx(0, 0, "[Error] - Failed to IoCreateDevice %wZ\n", dev_name);
 		return status;
 	}
 
-	status = IoCreateSymbolicLink(&DEVICE_SYMBOLIC_NAME, &DEVICE_NAME);
+	DbgPrintEx(0, 0, "[Info] - IoCreateDevice success\n");
+
+	RtlInitUnicodeString(&sym_link, L"\\DosDevices\\cikhlink");
+	status = IoCreateSymbolicLink(&sym_link, &dev_name);
 	if (!NT_SUCCESS(status))
 	{
-		DbgPrintEx(0, 0, "Error creating symbolic link %wZ\n", DEVICE_SYMBOLIC_NAME);
+		DbgPrintEx(0, 0, "[Error] - Failed to IoCreateSymbolicLink %wZ\n", sym_link);
 		return status;
 	}
 
+	SetFlag(dev_obj->Flags, DO_BUFFERED_IO); //set DO_BUFFERED_IO bit to 1
 
+	DbgPrintEx(0, 0, "[Info] - IoCreateSymbolicLink success\n");
+
+
+	for (int t = 0; t <= IRP_MJ_MAXIMUM_FUNCTION; t++) //set all MajorFunction's to unsupported
+		DriverObject->MajorFunction[t] = unsupported_io;
+
+	DriverObject->DriverUnload = DriverUnload;
+
+	// routine for handling IO requests from userland
+	DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = IOCTL_DispatchRoutine;
+	// routines that will execute once a handle to our device's symbolik link is opened/closed
+	DriverObject->MajorFunction[IRP_MJ_CREATE] = create_io;
+	DriverObject->MajorFunction[IRP_MJ_CLOSE] = close_io;
+
+	ClearFlag(dev_obj->Flags, DO_DEVICE_INITIALIZING);
 	return STATUS_SUCCESS;
 }
 
-NTSTATUS DriverEntry(
-	PDRIVER_OBJECT  driver_object,
-	PUNICODE_STRING registry_path
-)
+// called after the driver is loaded.
+// we define DriverEntry as custom entry point and then call our real entry function so we can use kdmapper to load it
+NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 {
-	// These are invalid for mapped drivers.
-	UNREFERENCED_PARAMETER(driver_object);
-	UNREFERENCED_PARAMETER(registry_path);
+	// invalid for drivers mapped with kdmapper
+	UNREFERENCED_PARAMETER(DriverObject);
+	UNREFERENCED_PARAMETER(RegistryPath);
 
-	NTSTATUS        status;
-	UNICODE_STRING  drvName;
-	RtlInitUnicodeString(&drvName, L"\\Driver\\CIKHDriver");
-	status = IoCreateDriver(&drvName, &RealEntry);
+	NTSTATUS status;
+	UNICODE_STRING  drv_name;
+	RtlInitUnicodeString(&drv_name, L"\\Driver\\cikhdriver");
+	status = IoCreateDriver(&drv_name, &RealEntry);
 	if (!NT_SUCCESS(status))
 	{
-		DbgPrintEx(0, 0, "[Error] - IoCreateDriver: %x\n", status);
+		DbgPrintEx(0, 0, "[Error] - IoCreateDriver failed with status %x\n", status);
 		return status;
 	}
 	return STATUS_SUCCESS;
