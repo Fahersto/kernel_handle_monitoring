@@ -3,6 +3,40 @@
 #include <ntifs.h>
 #include <ntddk.h>
 
+extern "C" NTSTATUS IoCreateDriver(IN PUNICODE_STRING DriverName OPTIONAL, IN PDRIVER_INITIALIZE InitializationFunction);
+
+typedef struct _KLDR_DATA_TABLE_ENTRY
+{
+	LIST_ENTRY InLoadOrderLinks;
+	PVOID ExceptionTable;
+	UINT32 ExceptionTableSize;
+	PVOID GpValue;
+	struct _NON_PAGED_DEBUG_INFO* NonPagedDebugInfo;
+	PVOID ImageBase;
+	PVOID EntryPoint;
+	UINT32 SizeOfImage;
+	UNICODE_STRING FullImageName;
+	UNICODE_STRING BaseImageName;
+	UINT32 Flags;
+	UINT16 LoadCount;
+
+	union
+	{
+		UINT16 SignatureLevel : 4;
+		UINT16 SignatureType : 3;
+		UINT16 Unused : 9;
+		UINT16 EntireField;
+	} u;
+
+	PVOID SectionPointer;
+	UINT32 CheckSum;
+	UINT32 CoverageSectionSize;
+	PVOID CoverageSection;
+	PVOID LoadedImports;
+	PVOID Spare;
+	UINT32 SizeOfImageNotRounded;
+	UINT32 TimeDateStamp;
+} KLDR_DATA_TABLE_ENTRY, * PKLDR_DATA_TABLE_ENTRY;
 
 typedef struct _LDR_DATA_TABLE_ENTRY
 {
@@ -15,6 +49,25 @@ typedef struct _LDR_DATA_TABLE_ENTRY
 	UNICODE_STRING FullDllName;
 	UNICODE_STRING BaseDllName;
 } LDR_DATA_TABLE_ENTRY, * PLDR_DATA_TABLE_ENTRY;
+
+typedef struct _DEVICE_MAP* PDEVICE_MAP;
+
+typedef struct _OBJECT_DIRECTORY_ENTRY
+{
+	_OBJECT_DIRECTORY_ENTRY* ChainLink;
+	PVOID Object;
+	ULONG HashValue;
+} OBJECT_DIRECTORY_ENTRY, * POBJECT_DIRECTORY_ENTRY;
+
+typedef struct _OBJECT_DIRECTORY
+{
+	POBJECT_DIRECTORY_ENTRY HashBuckets[37];
+	EX_PUSH_LOCK Lock;
+	PDEVICE_MAP DeviceMap;
+	ULONG SessionId;
+	PVOID NamespaceEntry;
+	ULONG Flags;
+} OBJECT_DIRECTORY, * POBJECT_DIRECTORY;
 
 __forceinline wchar_t locase_w(wchar_t c)
 {
@@ -148,21 +201,86 @@ PVOID get_kernel_base()
 			{
 				ImageBase = pMod[i].ImageBase;
 				break;
-				/*
-				g_KernelBase = pMod[i].ImageBase;
-				g_KernelSize = pMod[i].ImageSize;
-				if (pSize)
-					*pSize = g_KernelSize;
-				break;
-				*/
 			}
 		}
 	}
-
 	if (pMods)
 	{
 		ExFreePoolWithTag(pMods, 0x454E4F45); // 'ENON'
 	}
-
 	return ImageBase;
+}
+
+// based on https://github.com/not-wlan/driver-hijack
+extern "C" PDRIVER_OBJECT FindDriver(PUNICODE_STRING targetName)
+{
+	HANDLE handle{};
+	OBJECT_ATTRIBUTES attributes{};
+	UNICODE_STRING directory_name{};
+	PVOID directory{};
+
+	RtlInitUnicodeString(&directory_name, L"\\Driver");
+	InitializeObjectAttributes(&attributes, &directory_name, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+	// open OBJECT_DIRECTORY for \Driver
+	auto status = ZwOpenDirectoryObject(&handle, DIRECTORY_ALL_ACCESS, &attributes);
+
+	if (!NT_SUCCESS(status))
+	{
+		DbgPrintEx(0, 0, "[Error] - Failed to ZwOpenDirectoryObject %x\n", status);
+		return nullptr;
+	}
+
+	// Get OBJECT_DIRECTORY pointer from HANDLE
+	status = ObReferenceObjectByHandle(handle, DIRECTORY_ALL_ACCESS, nullptr, KernelMode, &directory, nullptr);
+
+	if (!NT_SUCCESS(status))
+	{
+		DbgPrintEx(0, 0, "[Error] - Failed to ObReferenceObjectByHandle %x\n", status);
+		ZwClose(handle);
+		return nullptr;
+	}
+
+	const auto directory_object = POBJECT_DIRECTORY(directory);
+	ExAcquirePushLockExclusiveEx(&directory_object->Lock, 0);
+
+	// traverse hash table with 37 entries
+	// when a new object is created, the object manager computes a hash value in the range zero to 36 from the object name and creates an OBJECT_DIRECTORY_ENTRY.    
+	// http://www.informit.com/articles/article.aspx?p=22443&seqNum=7
+	for (auto entry : directory_object->HashBuckets)
+	{
+		if (entry == nullptr)
+		{
+			continue;
+		}
+
+		while (entry != nullptr && entry->Object != nullptr)
+		{
+			// You could add type checking here with ObGetObjectType but if that's wrong we're gonna bsod anyway :P
+			auto driver = PDRIVER_OBJECT(entry->Object);
+
+			if (targetName && RtlCompareUnicodeString(&driver->DriverName, targetName, FALSE) == 0)
+			{
+				ExReleasePushLockExclusiveEx(&directory_object->Lock, 0);
+
+				// Release the acquired resources back to the OS
+				ObDereferenceObject(directory);
+				ZwClose(handle);
+
+				return driver;
+			}
+			entry = entry->ChainLink;
+		}
+	}
+	ExReleasePushLockExclusiveEx(&directory_object->Lock, 0);
+	ObDereferenceObject(directory);
+	ZwClose(handle);
+	return nullptr;
+}
+
+void GetProcessNameFromId(HANDLE processId, PUNICODE_STRING* name)
+{
+	PEPROCESS process = NULL;
+	PsLookupProcessByProcessId(processId, &process);
+	SeLocateProcessImageName(process, name);
 }

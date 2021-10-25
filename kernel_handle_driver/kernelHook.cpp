@@ -1,18 +1,14 @@
+/**
+* Registers an ObRegisterCallack from an unsigned (kdmapped) driver by abusing a "JMP RCX" instruction in a legit driver (original idea: https://www.unknowncheats.me/forum/2350590-post9.html) 
+*
+*/
+
 #include <ntifs.h>
 #include <ntddk.h>
 
 #include "Util.h"
 
-
-extern "C" NTSTATUS IoCreateDriver(IN PUNICODE_STRING DriverName OPTIONAL, IN PDRIVER_INITIALIZE InitializationFunction);
-
-/**/
-DRIVER_DISPATCH IOCTL_DispatchRoutine;
-
 #define IOCTL_MONITOR_HANDLES_OF_PROCESS  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x4711, METHOD_BUFFERED, FILE_ANY_ACCESS)
-
-//UNICODE_STRING DEVICE_NAME = RTL_CONSTANT_STRING(L"\\Device\\cikhdriver");
-//UNICODE_STRING DEVICE_SYMBOLIC_NAME = RTL_CONSTANT_STRING(L"\\DosDevices\\cikhdriver");
 
 // Kernel-Mode Process and Thread Manager callbacks
 BOOLEAN monitorThreadCreation = 0;
@@ -28,57 +24,22 @@ PVOID obCallbackRegistrationHandle = NULL;
 HANDLE currentlyMonitoredProcess = NULL;
 extern POBJECT_TYPE* IoDriverObjectType;
 
-typedef struct _KLDR_DATA_TABLE_ENTRY
-{
-	LIST_ENTRY InLoadOrderLinks;
-	PVOID ExceptionTable;
-	UINT32 ExceptionTableSize;
-	PVOID GpValue;
-	struct _NON_PAGED_DEBUG_INFO* NonPagedDebugInfo;
-	PVOID ImageBase;
-	PVOID EntryPoint;
-	UINT32 SizeOfImage;
-	UNICODE_STRING FullImageName;
-	UNICODE_STRING BaseImageName;
-	UINT32 Flags;
-	UINT16 LoadCount;
-
-	union
-	{
-		UINT16 SignatureLevel : 4;
-		UINT16 SignatureType : 3;
-		UINT16 Unused : 9;
-		UINT16 EntireField;
-	} u;
-
-	PVOID SectionPointer;
-	UINT32 CheckSum;
-	UINT32 CoverageSectionSize;
-	PVOID CoverageSection;
-	PVOID LoadedImports;
-	PVOID Spare;
-	UINT32 SizeOfImageNotRounded;
-	UINT32 TimeDateStamp;
-} KLDR_DATA_TABLE_ENTRY, * PKLDR_DATA_TABLE_ENTRY;
-
-
 NTSTATUS IOCTL_DispatchRoutine(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
 	UNREFERENCED_PARAMETER(DeviceObject);
 	PIO_STACK_LOCATION stackLocation = NULL;
 	CHAR* successMessage = "[Info] - Driver is monitoring process";
 	CHAR* errorMessage = "[Error] - Driver could not find processId";
-	CHAR* message = "hi";
+	CHAR* message = "";
 
-	DbgPrintEx(0, 0, "[Info] - IOCTL_DispatchRoutine\n");
+	DbgPrintEx(0, 0, "[Info] - Received IOCTL request\n");
 
 	stackLocation = IoGetCurrentIrpStackLocation(Irp);
 	if (stackLocation->Parameters.DeviceIoControl.IoControlCode == IOCTL_MONITOR_HANDLES_OF_PROCESS)
 	{
-		DbgPrintEx(0, 0, "[Info] - Received IOCTL_MONITOR_HANDLES_OF_PROCESS %lx\n", stackLocation->Parameters.DeviceIoControl.IoControlCode);
-
 		PHANDLE handle = (PHANDLE)Irp->AssociatedIrp.SystemBuffer;
-		DbgPrintEx(0, 0, "\tMonitor process %p\n", *handle);
+
+		DbgPrintEx(0, 0, "[Info] - Received request to monitor process %p\n", *handle);
 
 		PEPROCESS process = NULL;
 		PUNICODE_STRING processName = NULL;
@@ -86,6 +47,7 @@ NTSTATUS IOCTL_DispatchRoutine(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 		status = PsLookupProcessByProcessId(*handle, &process);
 		if (!NT_SUCCESS(status))
 		{
+			DbgPrintEx(0, 0, "[Error] - Failed to lookup process id %p\n", *handle);
 			message = errorMessage;
 		}
 		else
@@ -93,6 +55,7 @@ NTSTATUS IOCTL_DispatchRoutine(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 			currentlyMonitoredProcess = *handle;
 			message = successMessage;
 			SeLocateProcessImageName(process, &processName);
+			DbgPrintEx(0, 0, "[Info] - Monitoring process %wZ\n", processName);
 		}
 	}
 
@@ -104,7 +67,7 @@ NTSTATUS IOCTL_DispatchRoutine(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 	IoCompleteRequest(Irp, IO_NO_INCREMENT);
 	return STATUS_SUCCESS;
 }
-/*
+
 NTSTATUS MajorFunctions(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
 	UNREFERENCED_PARAMETER(DeviceObject);
@@ -113,36 +76,18 @@ NTSTATUS MajorFunctions(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 	switch (stackLocation->MajorFunction)
 	{
 	case IRP_MJ_CREATE:
-		DbgPrintEx(0, 0, "Handle to symbolink link opened\n");
+		DbgPrintEx(0, 0, "[Info] - Handle to symbolink link opened\n");
 		break;
 	case IRP_MJ_CLOSE:
-		DbgPrintEx(0, 0, "Handle to symbolink link closed\n");
+		DbgPrintEx(0, 0, "[Info] - Handle to symbolink link closed\n");
 		break;
 	default:
 		break;
-	}		Irp->IoStatus.Information = 0;
+	}
+	Irp->IoStatus.Information = 0;
 	Irp->IoStatus.Status = STATUS_SUCCESS;
 	IoCompleteRequest(Irp, IO_NO_INCREMENT);
 	return STATUS_SUCCESS;
-}
-*/
-
-NTSTATUS create_io(PDEVICE_OBJECT device_obj, PIRP irp) {
-	UNREFERENCED_PARAMETER(device_obj);
-
-	DbgPrintEx(0, 0, "[Info] - IOCTL create\n");
-
-	IoCompleteRequest(irp, IO_NO_INCREMENT);
-	return irp->IoStatus.Status;
-}
-
-NTSTATUS close_io(PDEVICE_OBJECT device_obj, PIRP irp) {
-	UNREFERENCED_PARAMETER(device_obj);
-
-	DbgPrintEx(0, 0, "[Info] - IOCTL close\n");
-
-	IoCompleteRequest(irp, IO_NO_INCREMENT);
-	return irp->IoStatus.Status;
 }
 
 // called when a thread is created or deleted
@@ -211,33 +156,23 @@ void LoadImageNotification_Callback(PUNICODE_STRING FullImageName, HANDLE Proces
 	}
 }
 
-void GetProcessNameFromId(HANDLE processId, PUNICODE_STRING* name)
-{
-	PEPROCESS process = NULL;
-	PsLookupProcessByProcessId(processId, &process);
-	SeLocateProcessImageName(process, name);
-}
-
 // called before a handle operation occures
 // https://docs.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nc-wdm-pob_pre_operation_callback
 OB_PREOP_CALLBACK_STATUS PreHandleOperationCallback(PVOID RegistrationContext, POB_PRE_OPERATION_INFORMATION pOperationInformation)
 {
 	UNREFERENCED_PARAMETER(RegistrationContext);
 
-	//DbgPrintEx(0, 0, "~~~ PreHandleOperationCallback ~~~\n");
-
-	if (!monitorHandleOperationPreCallback)
+	if (!monitorHandleOperationPreCallback || !currentlyMonitoredProcess || PsGetProcessId(PsGetCurrentProcess()) != currentlyMonitoredProcess)
 	{
 		return OB_PREOP_SUCCESS;
 	}
 
-	if (!currentlyMonitoredProcess || PsGetProcessId(PsGetCurrentProcess()) != currentlyMonitoredProcess)
-	{
-		return OB_PREOP_SUCCESS;
-	}
-
+	// get the name of the calling process
+	// this can be done because this callback runs in the context of the calling process
 	PUNICODE_STRING currentProcessName = NULL;
 	GetProcessNameFromId(PsGetProcessId(PsGetCurrentProcess()), &currentProcessName);
+
+	DbgPrintEx(0, 0, "[Info] - Handle operation PreCallback - %wZ\n", currentProcessName);
 
 	if (pOperationInformation->Operation == OB_OPERATION_HANDLE_CREATE)
 	{
@@ -245,14 +180,7 @@ OB_PREOP_CALLBACK_STATUS PreHandleOperationCallback(PVOID RegistrationContext, P
 		PVOID targetObject = pOperationInformation->Object;
 		POBJECT_TYPE targetObjectType = pOperationInformation->ObjectType;
 
-		// only print all acess for the time being
-		// TODO disable when doing live tests
-		//if (desiredAccess != PROCESS_ALL_ACCESS)
-		//{
-		//	return OB_PREOP_SUCCESS;
-		//}
-
-		DbgPrintEx(0, 0, "[Info] - Handle operation PreCallback - %wZ\n", currentProcessName);
+	
 
 		if (targetObjectType == *PsProcessType)
 		{
@@ -281,8 +209,6 @@ OB_PREOP_CALLBACK_STATUS PreHandleOperationCallback(PVOID RegistrationContext, P
 		//{
 		//	return OB_PREOP_SUCCESS;
 		//}
-
-		DbgPrintEx(0, 0, "[Info] - Handle operation PreCallback - %wZ\n", currentProcessName);
 
 		PUNICODE_STRING processName = NULL;
 		GetProcessNameFromId(PsGetProcessId((PEPROCESS)targetObject), &processName);
@@ -320,10 +246,11 @@ void PostHandleOperationCallback(PVOID RegistrationContext, POB_POST_OPERATION_I
 	DbgPrintEx(0, 0, "[Info] - ObRegisterCallback - Post Callback\n");
 }
 
+// will not be called since there is no easy way of unloading when kdmapping the driver
 void DriverUnload(PDRIVER_OBJECT dob)
 {
 	UNREFERENCED_PARAMETER(dob);
-	DbgPrintEx(0, 0, "[Info] - Unloading KernelHook driver\n");
+	DbgPrintEx(0, 0, "[Info] - Unloading cikh driver\n");
 
 	PsSetCreateProcessNotifyRoutineEx(CreateProcessNotification_Callback, TRUE);
 	PsRemoveCreateThreadNotifyRoutine(CreateThreadNotification_Callback);
@@ -334,122 +261,54 @@ void DriverUnload(PDRIVER_OBJECT dob)
 	//IoDeleteSymbolicLink(&DEVICE_SYMBOLIC_NAME);
 }
 
-typedef struct _DEVICE_MAP* PDEVICE_MAP;
-
-typedef struct _OBJECT_DIRECTORY_ENTRY
+NTSTATUS RegisterObRegisterCallback(POB_PRE_OPERATION_CALLBACK preOperationCallback)
 {
-	_OBJECT_DIRECTORY_ENTRY* ChainLink;
-	PVOID Object;
-	ULONG HashValue;
-} OBJECT_DIRECTORY_ENTRY, * POBJECT_DIRECTORY_ENTRY;
+	// ObRegisterCallback
+	OB_CALLBACK_REGISTRATION obCallbackRegistration = { 0, };
+	OB_OPERATION_REGISTRATION obOperationRegistration = { 0, };
 
-typedef struct _OBJECT_DIRECTORY
-{
-	POBJECT_DIRECTORY_ENTRY HashBuckets[37];
-	EX_PUSH_LOCK Lock;
-	PDEVICE_MAP DeviceMap;
-	ULONG SessionId;
-	PVOID NamespaceEntry;
-	ULONG Flags;
-} OBJECT_DIRECTORY, * POBJECT_DIRECTORY;
+	// "Drivers should specify OB_FLT_REGISTRATION_VERSION": https://docs.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/ns-wdm-_ob_callback_registration
+	obCallbackRegistration.Version = OB_FLT_REGISTRATION_VERSION;
 
+	// OB_OPERATION_REGISTRATION count
+	obCallbackRegistration.OperationRegistrationCount = 1;
 
-// based on https://github.com/not-wlan/driver-hijack
-extern "C" PDRIVER_OBJECT FindDriver(PUNICODE_STRING targetName)
-{
-	HANDLE handle{};
-	OBJECT_ATTRIBUTES attributes{};
-	UNICODE_STRING directory_name{};
-	PVOID directory{};
-	BOOLEAN success = FALSE;
+	// specifies when to load the driver
+	// the current value is in the load order group: "Activity Monitor" (360000-389999)
+	RtlInitUnicodeString(&obCallbackRegistration.Altitude, L"379482");
+	obCallbackRegistration.RegistrationContext = (PVOID)PreHandleOperationCallback;
 
-	RtlInitUnicodeString(&directory_name, L"\\Driver");
-	InitializeObjectAttributes(&attributes, &directory_name, OBJ_CASE_INSENSITIVE, NULL, NULL);
+	obOperationRegistration.ObjectType = PsProcessType; // todo there is also PsThreadType and on windows10 there is ExDesktopObjectType
 
-	// open OBJECT_DIRECTORY for \Driver
-	auto status = ZwOpenDirectoryObject(&handle, DIRECTORY_ALL_ACCESS, &attributes);
+	// operations the pre- and postcallbacks will be called for
+	// it seems there are only OB_OPERATION_HANDLE_CREATE and OB_OPERATION_HANDLE_DUPLICATE
+	// https://docs.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/ns-wdm-_ob_operation_registration
+	obOperationRegistration.Operations = OB_OPERATION_HANDLE_CREATE | OB_OPERATION_HANDLE_DUPLICATE;
 
-	if (!NT_SUCCESS(status))
-	{
-		DbgPrintEx(0, 0, "[Error] - Failed to ZwOpenDirectoryObject %x\n", status);
-		return nullptr;
-	}
+	// the pre operation is called before the operation occures
+	obOperationRegistration.PreOperation = preOperationCallback;
 
-	// Get OBJECT_DIRECTORY pointer from HANDLE
-	status = ObReferenceObjectByHandle(handle, DIRECTORY_ALL_ACCESS, nullptr, KernelMode, &directory, nullptr);
+	// the post operaton is called after the operation occured
+	//obOperationRegistration.PostOperation = (POB_POST_OPERATION_CALLBACK)jmpRcx;
 
-	if (!NT_SUCCESS(status)) 
-	{
-		DbgPrintEx(0, 0, "[Error] - Failed to ObReferenceObjectByHandle %x\n", status);
-		ZwClose(handle);
-		return nullptr;
-	}
+	obCallbackRegistration.OperationRegistration = &obOperationRegistration;
 
-	const auto directory_object = POBJECT_DIRECTORY(directory);
-
-	ExAcquirePushLockExclusiveEx(&directory_object->Lock, 0);
-
-	// traverse hash table with 37 entries
-	// when a new object is created, the object manager computes a hash value in the range zero to 36 from the object name and creates an OBJECT_DIRECTORY_ENTRY.    
-	// http://www.informit.com/articles/article.aspx?p=22443&seqNum=7
-	for (auto entry : directory_object->HashBuckets)
-	{
-		if (entry == nullptr)
-			continue;
-
-		if (success == TRUE)
-			break;
-
-		while (entry != nullptr && entry->Object != nullptr)
-		{
-			// You could add type checking here with ObGetObjectType but if that's wrong we're gonna bsod anyway :P
-			auto driver = PDRIVER_OBJECT(entry->Object);
-
-			if (targetName && RtlCompareUnicodeString(&driver->DriverName, targetName, FALSE) == 0)
-			{
-				ExReleasePushLockExclusiveEx(&directory_object->Lock, 0);
-
-				// Release the acquired resources back to the OS
-				ObDereferenceObject(directory);
-				ZwClose(handle);
-
-				return driver;
-			}
-
-			/*
-			DbgPrintEx(0, 0, "\tDriver %wZ at %p\n", driver->DriverName, driver);
-			if (driver && driver->DeviceObject)
-			{
-				DbgPrintEx(0, 0, "\tDeviceObject at %p\n", driver->DeviceObject);
-				if (driver && driver->DeviceObject)
-				{
-					DbgPrintEx(0, 0, "\t\tflags at %lx\n", driver->DeviceObject->Flags);
-					if (driver->DeviceObject->Flags & 0x20)
-					{
-						DbgPrintEx(0, 0, "~~~ MAAAAAAAAAAAAATCH ~~~~~~\n");
-					}
-				}
-			}*/
-			entry = entry->ChainLink;
-		}
-
-	}
-
-	ExReleasePushLockExclusiveEx(&directory_object->Lock, 0);
-
-	// Release the acquired resources back to the OS
-	ObDereferenceObject(directory);
-	ZwClose(handle);
-
-	return nullptr;
+	// register the callback
+	return ObRegisterCallbacks(&obCallbackRegistration, &obCallbackRegistrationHandle);
 }
 
-NTSTATUS unsupported_io(PDEVICE_OBJECT device_obj, PIRP irp) {
-	UNREFERENCED_PARAMETER(device_obj);
 
-	irp->IoStatus.Status = STATUS_NOT_SUPPORTED;
-	IoCompleteRequest(irp, IO_NO_INCREMENT);
-	return irp->IoStatus.Status;
+PVOID FindJmpRcxInstruction(unsigned char* startAddress, int searchLength)
+{
+	for (int i = 0; i < searchLength; i++)
+	{
+		// FF E1  jmp rcx
+		if (startAddress[i] == 0xff && startAddress[i + 1] == 0xe1)
+		{
+			return startAddress + i;
+		}
+	}
+	return nullptr;
 }
 
 NTSTATUS RealEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
@@ -460,11 +319,11 @@ NTSTATUS RealEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 	NTSTATUS status = 0;
 
 	DbgPrintEx(0, 0, "[Info] - RealEntry called\n");
-	DbgPrintEx(0, 0, "\tDriver object %p\n", DriverObject);
+	DbgPrintEx(0, 0, "\tDriverObject %p\n", DriverObject);
 
 	// when mapped with kdmapper it is expected that DriverSection is NULL
 	// this serves as a reminder, that we don't have a valid driver when mapping it
-	DbgPrintEx(0, 0, "\tDriver section %p\n", DriverObject->DriverSection);
+	DbgPrintEx(0, 0, "\tDriverSection %p\n", DriverObject->DriverSection);
 
 	UNICODE_STRING  drvName;
 	RtlInitUnicodeString(&drvName, L"\\Driver\\DXGKrnl");
@@ -486,103 +345,61 @@ NTSTATUS RealEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 	//	and check the flags of that PDRIVER_OBJECT->DriverSection for 0x20 
 	DbgPrintEx(0, 0, "[Info] - PKLDR_DATA_TABLE_ENTRY flags %x\n", targetDriverSection->Flags);
 
-	PVOID jmpRcx = nullptr;
-	unsigned char* currentAddress = (unsigned char*)targetDriver->DriverStart;
-	for (int i = 0; i < 0x100000; i++)
-	{
-		// FF E1  jmp rcx
-		if (currentAddress[i] == 0xff && currentAddress[i+1] == 0xe1)
-		{
-			jmpRcx = currentAddress + i;
-			DbgPrintEx(0, 0, "[Info] - Found \"jmp rcx\" at %p\n", currentAddress);
-			break;
-		}
-	}
-
+	PVOID jmpRcx = FindJmpRcxInstruction((unsigned char*)targetDriver->DriverStart, 0x100000);
 	if (!jmpRcx)
 	{
-		DbgPrintEx(0, 0, "[Error] - Failed to find \"jmp rcx\" in %wZ\n", targetDriver->DriverName);
+		DbgPrintEx(0, 0, "[Error] - Failed to find \"JMP RCX\" in %wZ\n", targetDriver->DriverName);
 		return STATUS_UNSUCCESSFUL;
 	}
 
-	// ObRegisterCallback
-	OB_CALLBACK_REGISTRATION obCallbackRegistration = { 0, };
-	OB_OPERATION_REGISTRATION obOperationRegistration = { 0, };
+	DbgPrintEx(0, 0, "[Info] - Found \"JMP RCX\" in %wZ at address %p\n", targetDriver->DriverName, jmpRcx);
 
-	// "Drivers should specify OB_FLT_REGISTRATION_VERSION": https://docs.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/ns-wdm-_ob_callback_registration
-	obCallbackRegistration.Version = OB_FLT_REGISTRATION_VERSION;
-
-	// OB_OPERATION_REGISTRATION count
-	obCallbackRegistration.OperationRegistrationCount = 1;
-
-	// specifies when to load the driver
-	// the current value is in the load order group: "Activity Monitor" (360000-389999)
-	RtlInitUnicodeString(&obCallbackRegistration.Altitude, L"379482");
-	obCallbackRegistration.RegistrationContext = (PVOID)PreHandleOperationCallback;
-
-	obOperationRegistration.ObjectType = PsProcessType; // todo there is also PsThreadType and on windows10 there is ExDesktopObjectType
-
-	// operations the pre- and postcallbacks will be called for
-	// it seems there are only OB_OPERATION_HANDLE_CREATE and OB_OPERATION_HANDLE_DUPLICATE
-	// https://docs.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/ns-wdm-_ob_operation_registration
-	obOperationRegistration.Operations = OB_OPERATION_HANDLE_CREATE;
-
-	// the pre operation is called before the operation occures
-	obOperationRegistration.PreOperation = (POB_PRE_OPERATION_CALLBACK)jmpRcx;
-
-	// the post operaton is called after the operation occured
-	//obOperationRegistration.PostOperation = (POB_POST_OPERATION_CALLBACK)jmpRcx;
-
-	obCallbackRegistration.OperationRegistration = &obOperationRegistration;
-
-	// register the callback
-	status = ObRegisterCallbacks(&obCallbackRegistration, &obCallbackRegistrationHandle);
+	status = RegisterObRegisterCallback((POB_PRE_OPERATION_CALLBACK)jmpRcx);
 	if (!NT_SUCCESS(status))
 	{
 		DbgPrintEx(0, 0, "[Error] - Failed ObRegisterCallbacks: %x\n", status);
 		return status;
 	}
 
-	DbgPrintEx(0, 0, "[Info] - ObRegisterCallbacks success\n");
+	DbgPrintEx(0, 0, "[Info] - ObRegisterCallbacks registered successfully\n");
 
-	PDEVICE_OBJECT dev_obj;
-	UNICODE_STRING dev_name, sym_link;
-	RtlInitUnicodeString(&dev_name, L"\\Device\\cikhdevice");
+	UNICODE_STRING deviceName;
+	RtlInitUnicodeString(&deviceName, L"\\Device\\cikhdevice");
 
-	status = IoCreateDevice(DriverObject, 0, &dev_name, FILE_DEVICE_UNKNOWN, FILE_DEVICE_SECURE_OPEN, FALSE, &dev_obj);
+	status = IoCreateDevice(DriverObject, 0, &deviceName, FILE_DEVICE_UNKNOWN, FILE_DEVICE_SECURE_OPEN, FALSE, &DriverObject->DeviceObject);
 	if (!NT_SUCCESS(status))
 	{
-		DbgPrintEx(0, 0, "[Error] - Failed to IoCreateDevice %wZ\n", dev_name);
+		DbgPrintEx(0, 0, "[Error] - Failed to IoCreateDevice %wZ\n", deviceName);
 		return status;
 	}
 
-	DbgPrintEx(0, 0, "[Info] - IoCreateDevice success\n");
+	DbgPrintEx(0, 0, "[Info] - IoDevice created successfully\n");
 
-	RtlInitUnicodeString(&sym_link, L"\\DosDevices\\cikhlink");
-	status = IoCreateSymbolicLink(&sym_link, &dev_name);
+	UNICODE_STRING symbolicLinkName;
+	RtlInitUnicodeString(&symbolicLinkName, L"\\DosDevices\\cikhlink");
+	status = IoCreateSymbolicLink(&symbolicLinkName, &deviceName);
 	if (!NT_SUCCESS(status))
 	{
-		DbgPrintEx(0, 0, "[Error] - Failed to IoCreateSymbolicLink %wZ\n", sym_link);
+		DbgPrintEx(0, 0, "[Error] - Failed to IoCreateSymbolicLink %wZ\n", symbolicLinkName);
 		return status;
 	}
 
-	SetFlag(dev_obj->Flags, DO_BUFFERED_IO); //set DO_BUFFERED_IO bit to 1
-
-	DbgPrintEx(0, 0, "[Info] - IoCreateSymbolicLink success\n");
-
-
-	for (int t = 0; t <= IRP_MJ_MAXIMUM_FUNCTION; t++) //set all MajorFunction's to unsupported
-		DriverObject->MajorFunction[t] = unsupported_io;
+	DbgPrintEx(0, 0, "[Info] - IoSymbolicLink created successfully\n");
 
 	DriverObject->DriverUnload = DriverUnload;
 
 	// routine for handling IO requests from userland
 	DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = IOCTL_DispatchRoutine;
-	// routines that will execute once a handle to our device's symbolik link is opened/closed
-	DriverObject->MajorFunction[IRP_MJ_CREATE] = create_io;
-	DriverObject->MajorFunction[IRP_MJ_CLOSE] = close_io;
 
-	ClearFlag(dev_obj->Flags, DO_DEVICE_INITIALIZING);
+	// routines that will execute once a handle to our device's symbolik link is opened/closed
+	DriverObject->MajorFunction[IRP_MJ_CREATE] = MajorFunctions;
+	DriverObject->MajorFunction[IRP_MJ_CLOSE] = MajorFunctions;
+
+	// https://docs.microsoft.com/en-us/windows-hardware/drivers/ifs/clearing-the-do-device-initializing-flag
+	// this flag should be cleared after attaching the device object
+	// not doing so may break IOCTL communication
+	ClearFlag(DriverObject->DeviceObject->Flags, DO_DEVICE_INITIALIZING);
+
 	return STATUS_SUCCESS;
 }
 
