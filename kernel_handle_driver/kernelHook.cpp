@@ -5,10 +5,12 @@
 
 #include <ntifs.h>
 #include <ntddk.h>
-
 #include "Util.h"
 
 #define IOCTL_MONITOR_HANDLES_OF_PROCESS  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x4711, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+#define PROCESS_VM_OPERATION               (0x0008)  
+#define PROCESS_VM_WRITE                   (0x0020)  
 
 // Kernel-Mode Process and Thread Manager callbacks
 BOOLEAN monitorThreadCreation = 0;
@@ -18,11 +20,11 @@ BOOLEAN monitorImageLoading = 0;
 // ObRegisterCallback
 BOOLEAN monitorHandleOperationPreCallback = 1;
 BOOLEAN monitorHandleOperationPostCallback = 0;
+BOOLEAN ignoreHandlesToOwnProcess = 1;
 
 PVOID obCallbackRegistrationHandle = NULL;
 
 HANDLE currentlyMonitoredProcess = NULL;
-extern POBJECT_TYPE* IoDriverObjectType;
 
 NTSTATUS IOCTL_DispatchRoutine(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
@@ -63,7 +65,6 @@ NTSTATUS IOCTL_DispatchRoutine(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 	Irp->IoStatus.Status = STATUS_SUCCESS;
 
 	RtlCopyMemory(Irp->AssociatedIrp.SystemBuffer, message, strlen(message));
-
 	IoCompleteRequest(Irp, IO_NO_INCREMENT);
 	return STATUS_SUCCESS;
 }
@@ -170,7 +171,8 @@ OB_PREOP_CALLBACK_STATUS PreHandleOperationCallback(PVOID RegistrationContext, P
 	// get the name of the calling process
 	// this can be done because this callback runs in the context of the calling process
 	PUNICODE_STRING currentProcessName = NULL;
-	GetProcessNameFromId(PsGetProcessId(PsGetCurrentProcess()), &currentProcessName);
+	HANDLE currentProcessId = PsGetProcessId(PsGetCurrentProcess());
+	GetProcessNameFromId(currentProcessId, &currentProcessName);
 
 	DbgPrintEx(0, 0, "[Info] - Handle operation PreCallback - %wZ\n", currentProcessName);
 
@@ -180,14 +182,21 @@ OB_PREOP_CALLBACK_STATUS PreHandleOperationCallback(PVOID RegistrationContext, P
 		PVOID targetObject = pOperationInformation->Object;
 		POBJECT_TYPE targetObjectType = pOperationInformation->ObjectType;
 
-	
-
 		if (targetObjectType == *PsProcessType)
 		{
 			PUNICODE_STRING processName = NULL;
-			GetProcessNameFromId(PsGetProcessId((PEPROCESS)targetObject), &processName);
+			HANDLE targetProcessId = PsGetProcessId((PEPROCESS)targetObject);
+			GetProcessNameFromId(targetProcessId, &processName);
 
+			if (ignoreHandlesToOwnProcess && currentProcessId == targetProcessId)
+			{
+				return OB_PREOP_SUCCESS;
+			}
 			DbgPrintEx(0, 0, "\tCreating handle to process %wZ(%p) with access %lx\n", processName, targetObject, desiredAccess);
+			if ((desiredAccess & PROCESS_VM_WRITE) && (desiredAccess & PROCESS_VM_OPERATION))
+			{
+				DbgPrintEx(0, 0, "\t--> This handle can be used to WPM\n");
+			}
 		}
 		else // PsThreadType
 		{
@@ -222,6 +231,10 @@ OB_PREOP_CALLBACK_STATUS PreHandleOperationCallback(PVOID RegistrationContext, P
 		if (targetObjectType == *PsProcessType)
 		{
 			DbgPrintEx(0, 0, "\tDuplicating handle to process %wZ(%p) with access %lx (source: %wZ, target: %wZ)\n", processName, targetObject, desiredAccess, sourceProcessName, targetProcessName);
+			if ((desiredAccess & PROCESS_VM_WRITE) && (desiredAccess & PROCESS_VM_OPERATION))
+			{
+				DbgPrintEx(0, 0, "\t--> This handle can be used to WPM\n");
+			}
 		}
 		else // PsThreadType
 		{
@@ -365,7 +378,7 @@ NTSTATUS RealEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 
 	UNICODE_STRING deviceName;
 	RtlInitUnicodeString(&deviceName, L"\\Device\\cikhdevice");
-
+	
 	status = IoCreateDevice(DriverObject, 0, &deviceName, FILE_DEVICE_UNKNOWN, FILE_DEVICE_SECURE_OPEN, FALSE, &DriverObject->DeviceObject);
 	if (!NT_SUCCESS(status))
 	{
